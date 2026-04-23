@@ -80,13 +80,28 @@ impl SolarGridContract {
         if amount <= 0 {
             panic!("amount must be positive");
         }
-        let key = DataKey::Meter(meter_id);
+        let key = DataKey::Meter(meter_id.clone());
         let mut meter: Meter = env.storage().persistent().get(&key).expect("meter not found");
+        let was_active = meter.active;
         meter.balance += amount;
         meter.active = true;
-        meter.plan = plan;
+        meter.plan = plan.clone();
         meter.last_payment = env.ledger().timestamp();
         env.storage().persistent().set(&key, &meter);
+
+        // Emit payment_received event
+        env.events().publish(
+            (symbol_short!("payment"), symbol_short!("received")),
+            (meter_id.clone(), amount, plan),
+        );
+
+        // Emit meter_activated if it just transitioned from inactive
+        if !was_active {
+            env.events().publish(
+                (symbol_short!("meter"), symbol_short!("activated")),
+                meter_id,
+            );
+        }
     }
 
     /// Check whether a meter currently has active energy access.
@@ -100,15 +115,23 @@ impl SolarGridContract {
     /// Deducts cost from balance; deactivates meter if balance runs out.
     pub fn update_usage(env: Env, meter_id: Symbol, units: u64, cost: i128) {
         Self::require_admin(&env);
-        let key = DataKey::Meter(meter_id);
+        let key = DataKey::Meter(meter_id.clone());
         let mut meter: Meter = env.storage().persistent().get(&key).expect("meter not found");
         meter.units_used += units;
         meter.balance -= cost;
         if meter.balance <= 0 {
             meter.balance = 0;
             meter.active = false;
+            env.storage().persistent().set(&key, &meter);
+
+            // Emit meter_deactivated event
+            env.events().publish(
+                (symbol_short!("meter"), symbol_short!("deactivated")),
+                meter_id,
+            );
+        } else {
+            env.storage().persistent().set(&key, &meter);
         }
-        env.storage().persistent().set(&key, &meter);
     }
 
     /// Get meter details.
