@@ -139,6 +139,48 @@ impl SolarGridContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Add an address to the meter-owner allowlist.
+    /// Only the admin may call this. Use this to pre-approve user accounts
+    /// (G… addresses) before they can be registered as meter owners.
+    pub fn allowlist_add(env: Env, owner: Address) {
+        Self::require_admin(&env);
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ALLOWLIST)
+            .unwrap_or(Vec::new(&env));
+        if !list.contains(&owner) {
+            list.push_back(owner);
+            env.storage().instance().set(&ALLOWLIST, &list);
+        }
+    }
+
+    /// Remove an address from the meter-owner allowlist.
+    /// Only the admin may call this.
+    pub fn allowlist_remove(env: Env, owner: Address) {
+        Self::require_admin(&env);
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ALLOWLIST)
+            .unwrap_or(Vec::new(&env));
+        let mut new_list: Vec<Address> = Vec::new(&env);
+        for addr in list.iter() {
+            if addr != owner {
+                new_list.push_back(addr);
+            }
+        }
+        env.storage().instance().set(&ALLOWLIST, &new_list);
+    }
+
+    /// Returns the current allowlist.
+    pub fn get_allowlist(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&ALLOWLIST)
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// Make a payment to top up a meter's balance and activate it.
     /// `amount` is in stroops. `plan` sets the billing cycle.
     pub fn make_payment(
