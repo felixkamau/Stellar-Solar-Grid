@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import Link from "next/link";
 import Navbar from "@/components/Navbar";
 import { useWalletStore } from "@/store/walletStore";
 import {
@@ -31,8 +30,6 @@ export default function HistoryPage() {
   const [pagination, setPagination] = useState({ page: 1, pages: 1, total: 0 });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // Client-side sort (within the current page)
   const [sortField, setSortField] = useState<SortField>("date");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
 
@@ -42,7 +39,6 @@ export default function HistoryPage() {
       setLoading(true);
       setError(null);
       try {
-        // Pass top-level date sort to backend; client handles other columns
         const serverSort = sortField === "date" ? sortDir : "desc";
         const data: PaymentHistoryResponse = await getPaymentHistory(
           address,
@@ -51,7 +47,11 @@ export default function HistoryPage() {
           serverSort
         );
         setRecords(data.payments);
-        setPagination({ page: data.pagination.page, pages: data.pagination.pages, total: data.pagination.total });
+        setPagination({
+          page: data.pagination.page,
+          pages: data.pagination.pages,
+          total: data.pagination.total,
+        });
       } catch (e: any) {
         setError(e.message ?? "Failed to load payment history");
       } finally {
@@ -89,19 +89,21 @@ export default function HistoryPage() {
   }
 
   const thClass =
-    "px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-gray-400 cursor-pointer select-none hover:text-solar-yellow transition";
+    "px-3 py-3 text-left text-xs font-semibold uppercase tracking-wider text-gray-400 cursor-pointer select-none hover:text-solar-yellow transition whitespace-nowrap";
 
   return (
     <>
       <Navbar />
-      <main className="min-h-screen px-4 py-10 max-w-5xl mx-auto">
-        <h1 className="text-3xl font-bold text-solar-yellow mb-2">Payment History</h1>
-        <p className="text-gray-400 mb-8 text-sm">
+      <main className="min-h-screen px-4 py-8 max-w-5xl mx-auto">
+        <h1 className="text-2xl sm:text-3xl font-bold text-solar-yellow mb-1">
+          Payment History
+        </h1>
+        <p className="text-gray-400 mb-6 text-sm">
           All <code className="text-solar-yellow">make_payment</code> transactions for your wallet.
         </p>
 
         {!address && (
-          <div className="rounded-lg border border-white/10 bg-solar-accent p-8 text-center text-gray-400">
+          <div className="rounded-lg border border-white/10 bg-solar-accent p-8 text-center text-gray-400 text-sm">
             Connect your wallet to view payment history.
           </div>
         )}
@@ -114,8 +116,49 @@ export default function HistoryPage() {
 
         {address && !error && (
           <>
-            <div className="overflow-x-auto rounded-xl border border-white/10">
-              <table className="w-full text-sm">
+            {/* ── Mobile card list (hidden on sm+) ── */}
+            <div className="sm:hidden space-y-3">
+              {loading && (
+                <p className="text-center text-gray-500 py-10">Loading…</p>
+              )}
+              {!loading && sorted.length === 0 && (
+                <p className="text-center text-gray-500 py-10">No payment records found.</p>
+              )}
+              {!loading &&
+                sorted.map((r, i) => (
+                  <div
+                    key={r.txHash || i}
+                    className="rounded-xl border border-white/10 bg-solar-accent p-4 space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-solar-yellow font-bold text-base">
+                        {r.amountXlm.toFixed(4)} XLM
+                      </span>
+                      <PlanBadge plan={r.plan} />
+                    </div>
+                    <div className="text-xs text-gray-400">
+                      {new Date(r.date).toLocaleString()}
+                    </div>
+                    <div className="text-xs text-gray-300 font-mono">
+                      Meter: {r.meterId}
+                    </div>
+                    {r.txHash && (
+                      <a
+                        href={`${EXPLORER_BASE}/${r.txHash}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="block text-xs text-blue-400 underline underline-offset-2 font-mono truncate"
+                      >
+                        {r.txHash.slice(0, 10)}…{r.txHash.slice(-8)} ↗
+                      </a>
+                    )}
+                  </div>
+                ))}
+            </div>
+
+            {/* ── Desktop table (hidden below sm) ── */}
+            <div className="hidden sm:block overflow-x-auto rounded-xl border border-white/10" style={{ WebkitOverflowScrolling: "touch" }}>
+              <table className="w-full text-sm min-w-[600px]">
                 <thead className="bg-solar-accent border-b border-white/10">
                   <tr>
                     <th className={thClass} onClick={() => handleSort("date")}>
@@ -130,7 +173,7 @@ export default function HistoryPage() {
                     <th className={thClass} onClick={() => handleSort("plan")}>
                       Plan <SortIcon field="plan" />
                     </th>
-                    <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-gray-400">
+                    <th className="px-3 py-3 text-left text-xs font-semibold uppercase tracking-wider text-gray-400 whitespace-nowrap">
                       Tx Hash
                     </th>
                   </tr>
@@ -156,17 +199,17 @@ export default function HistoryPage() {
                         key={r.txHash || i}
                         className="border-t border-white/5 hover:bg-white/5 transition"
                       >
-                        <td className="px-4 py-3 text-gray-300 whitespace-nowrap">
+                        <td className="px-3 py-3 text-gray-300 whitespace-nowrap text-xs">
                           {new Date(r.date).toLocaleString()}
                         </td>
-                        <td className="px-4 py-3 font-mono text-gray-200">{r.meterId}</td>
-                        <td className="px-4 py-3 text-solar-yellow font-semibold">
+                        <td className="px-3 py-3 font-mono text-gray-200 text-xs">{r.meterId}</td>
+                        <td className="px-3 py-3 text-solar-yellow font-semibold text-xs">
                           {r.amountXlm.toFixed(4)}
                         </td>
-                        <td className="px-4 py-3">
+                        <td className="px-3 py-3">
                           <PlanBadge plan={r.plan} />
                         </td>
-                        <td className="px-4 py-3 font-mono text-xs">
+                        <td className="px-3 py-3 font-mono text-xs">
                           {r.txHash ? (
                             <a
                               href={`${EXPLORER_BASE}/${r.txHash}`}
@@ -189,7 +232,7 @@ export default function HistoryPage() {
 
             {/* Pagination */}
             {pagination.pages > 1 && (
-              <div className="mt-6 flex items-center justify-between text-sm text-gray-400">
+              <div className="mt-6 flex flex-col sm:flex-row items-center justify-between gap-3 text-sm text-gray-400">
                 <span>
                   {pagination.total} record{pagination.total !== 1 ? "s" : ""} total
                 </span>
@@ -197,17 +240,17 @@ export default function HistoryPage() {
                   <button
                     disabled={pagination.page <= 1 || loading}
                     onClick={() => fetchHistory(pagination.page - 1)}
-                    className="rounded-lg border border-white/10 px-3 py-1.5 hover:border-solar-yellow hover:text-solar-yellow disabled:opacity-30 disabled:cursor-not-allowed transition"
+                    className="rounded-lg border border-white/10 px-4 py-2 hover:border-solar-yellow hover:text-solar-yellow disabled:opacity-30 disabled:cursor-not-allowed transition"
                   >
                     ← Prev
                   </button>
-                  <span className="px-2">
-                    Page {pagination.page} of {pagination.pages}
+                  <span className="px-2 text-xs">
+                    {pagination.page} / {pagination.pages}
                   </span>
                   <button
                     disabled={pagination.page >= pagination.pages || loading}
                     onClick={() => fetchHistory(pagination.page + 1)}
-                    className="rounded-lg border border-white/10 px-3 py-1.5 hover:border-solar-yellow hover:text-solar-yellow disabled:opacity-30 disabled:cursor-not-allowed transition"
+                    className="rounded-lg border border-white/10 px-4 py-2 hover:border-solar-yellow hover:text-solar-yellow disabled:opacity-30 disabled:cursor-not-allowed transition"
                   >
                     Next →
                   </button>
@@ -230,7 +273,7 @@ function PlanBadge({ plan }: { plan: string }) {
   };
   const cls = styles[plan] ?? "bg-gray-800 text-gray-400 border-gray-700/40";
   return (
-    <span className={`rounded-full border px-2.5 py-0.5 text-xs font-medium ${cls}`}>
+    <span className={`rounded-full border px-2 py-0.5 text-xs font-medium whitespace-nowrap ${cls}`}>
       {plan}
     </span>
   );
