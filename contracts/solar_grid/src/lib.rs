@@ -35,7 +35,10 @@ pub enum DataKey {
     Meter(Symbol),
 }
 
-// ── Contract ──────────────────────────────────────────────────────────────────
+// ── Event topics (contract namespace) ────────────────────────────────────────
+
+const EVT_NS: Symbol = symbol_short!("solargrid");
+
 
 #[contract]
 pub struct SolarGridContract;
@@ -137,6 +140,10 @@ impl SolarGridContract {
 
     /// Make a payment to top up a meter's balance and activate it.
     /// `amount` is in stroops. `plan` sets the billing cycle.
+    ///
+    /// Emits:
+    /// - `payment_received { meter_id, payer, amount, plan }`
+    /// - `meter_activated  { meter_id }` (always, since payment activates the meter)
     pub fn make_payment(
         env: Env,
         meter_id: Symbol,
@@ -156,10 +163,15 @@ impl SolarGridContract {
         meter.last_payment = env.ledger().timestamp();
         env.storage().persistent().set(&key, &meter);
 
-        // Emit event so payment history can be queried via Soroban RPC
+        // payment_received
         env.events().publish(
-            (symbol_short!("payment"), meter_id, payer),
-            (amount, plan),
+            (symbol_short!("pmt_rcvd"), EVT_NS, meter_id.clone()),
+            (payer, amount, plan),
+        );
+        // meter_activated — payment always activates the meter
+        env.events().publish(
+            (symbol_short!("mtr_actv"), EVT_NS, meter_id),
+            (),
         );
     }
 
@@ -172,17 +184,37 @@ impl SolarGridContract {
 
     /// Called by the IoT oracle to record energy consumption (milli-kWh).
     /// Deducts cost from balance; deactivates meter if balance runs out.
+    ///
+    /// Emits:
+    /// - `usage_updated    { meter_id, units, cost }`
+    /// - `meter_deactivated { meter_id }` (only when balance hits zero)
     pub fn update_usage(env: Env, meter_id: Symbol, units: u64, cost: i128) {
         Self::require_admin(&env);
-        let key = DataKey::Meter(meter_id);
+        let key = DataKey::Meter(meter_id.clone());
         let mut meter: Meter = env.storage().persistent().get(&key).expect("meter not found");
         meter.units_used += units;
         meter.balance -= cost;
-        if meter.balance <= 0 {
+        let deactivated = if meter.balance <= 0 {
             meter.balance = 0;
             meter.active = false;
-        }
+            true
+        } else {
+            false
+        };
         env.storage().persistent().set(&key, &meter);
+
+        // usage_updated
+        env.events().publish(
+            (symbol_short!("usg_upd"), EVT_NS, meter_id.clone()),
+            (units, cost),
+        );
+        // meter_deactivated — only when balance drained to zero
+        if deactivated {
+            env.events().publish(
+                (symbol_short!("mtr_deact"), EVT_NS, meter_id),
+                (),
+            );
+        }
     }
 
     /// Get meter details.
@@ -192,12 +224,28 @@ impl SolarGridContract {
     }
 
     /// Admin can manually toggle meter access (e.g. maintenance).
+    ///
+    /// Emits:
+    /// - `meter_activated   { meter_id }` when toggled on
+    /// - `meter_deactivated { meter_id }` when toggled off
     pub fn set_active(env: Env, meter_id: Symbol, active: bool) {
         Self::require_admin(&env);
-        let key = DataKey::Meter(meter_id);
+        let key = DataKey::Meter(meter_id.clone());
         let mut meter: Meter = env.storage().persistent().get(&key).expect("meter not found");
         meter.active = active;
         env.storage().persistent().set(&key, &meter);
+
+        if active {
+            env.events().publish(
+                (symbol_short!("mtr_actv"), EVT_NS, meter_id),
+                (),
+            );
+        } else {
+            env.events().publish(
+                (symbol_short!("mtr_deact"), EVT_NS, meter_id),
+                (),
+            );
+        }
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -426,5 +474,96 @@ mod tests {
         // Should not panic
         client.allowlist_remove(&user);
         assert!(!client.get_allowlist().contains(&user));
+    }
+
+    // ── Event emission tests ──────────────────────────────────────────────────
+
+    /// make_payment emits payment_received and meter_activated.
+    #[test]
+    fn test_make_payment_emits_events() {
+        let (env, client, _admin) = setup();
+        let user = Address::generate(&env);
+        let meter_id = symbol_short!("EVTM1");
+        allowlist_and_register(&client, &meter_id, &user);
+
+        client.make_payment(&meter_id, &user, &5_000_000_i128, &PaymentPlan::Daily);
+
+        let events = env.events().all();
+        // Expect at least 2 events from make_payment
+        assert!(events.len() >= 2);
+
+        let topics_0: soroban_sdk::Vec<soroban_sdk::Val> = events.get(0).unwrap().0;
+        let topics_1: soroban_sdk::Vec<soroban_sdk::Val> = events.get(1).unwrap().0;
+
+        let name_0 = soroban_sdk::Symbol::try_from_val(&env, &topics_0.get(1).unwrap()).unwrap();
+        let name_1 = soroban_sdk::Symbol::try_from_val(&env, &topics_1.get(1).unwrap()).unwrap();
+
+        // topic[0] is the contract address; topic[1] is our event name
+        assert!(
+            name_0 == symbol_short!("pmt_rcvd") || name_1 == symbol_short!("pmt_rcvd"),
+            "payment_received event not found"
+        );
+        assert!(
+            name_0 == symbol_short!("mtr_actv") || name_1 == symbol_short!("mtr_actv"),
+            "meter_activated event not found"
+        );
+    }
+
+    /// update_usage emits usage_updated; draining balance also emits meter_deactivated.
+    #[test]
+    fn test_update_usage_emits_events() {
+        let (env, client, _admin) = setup();
+        let user = Address::generate(&env);
+        let meter_id = symbol_short!("EVTM2");
+        allowlist_and_register(&client, &meter_id, &user);
+        client.make_payment(&meter_id, &user, &5_000_000_i128, &PaymentPlan::UsageBased);
+
+        // Partial usage — only usage_updated expected
+        env.events().all(); // clear by reading (events accumulate per tx in tests)
+        client.update_usage(&meter_id, &10_u64, &1_000_000_i128);
+        let events = env.events().all();
+        let has_usg = events.iter().any(|(topics, _)| {
+            soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
+                .map(|s| s == symbol_short!("usg_upd"))
+                .unwrap_or(false)
+        });
+        assert!(has_usg, "usage_updated event not found");
+
+        // Drain balance — should also emit meter_deactivated
+        client.update_usage(&meter_id, &10_u64, &4_000_000_i128);
+        let events2 = env.events().all();
+        let has_deact = events2.iter().any(|(topics, _)| {
+            soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
+                .map(|s| s == symbol_short!("mtr_deact"))
+                .unwrap_or(false)
+        });
+        assert!(has_deact, "meter_deactivated event not found after balance drain");
+    }
+
+    /// set_active emits meter_activated or meter_deactivated depending on the flag.
+    #[test]
+    fn test_set_active_emits_events() {
+        let (env, client, _admin) = setup();
+        let user = Address::generate(&env);
+        let meter_id = symbol_short!("EVTM3");
+        allowlist_and_register(&client, &meter_id, &user);
+
+        client.set_active(&meter_id, &true);
+        let events = env.events().all();
+        let has_actv = events.iter().any(|(topics, _)| {
+            soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
+                .map(|s| s == symbol_short!("mtr_actv"))
+                .unwrap_or(false)
+        });
+        assert!(has_actv, "meter_activated event not found");
+
+        client.set_active(&meter_id, &false);
+        let events2 = env.events().all();
+        let has_deact = events2.iter().any(|(topics, _)| {
+            soroban_sdk::Symbol::try_from_val(&env, &topics.get(1).unwrap())
+                .map(|s| s == symbol_short!("mtr_deact"))
+                .unwrap_or(false)
+        });
+        assert!(has_deact, "meter_deactivated event not found");
     }
 }
