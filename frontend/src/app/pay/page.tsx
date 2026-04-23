@@ -65,10 +65,10 @@ export default function PayPage() {
   return (
     <>
       <Navbar />
-      <main className="min-h-screen flex items-start justify-center px-4 py-16">
+      <main className="min-h-screen flex items-start justify-center px-4 py-8 sm:py-16">
         <div className="w-full max-w-md">
-          <h1 className="text-3xl font-bold text-solar-yellow mb-2">Make a Payment</h1>
-          <p className="text-gray-400 text-sm mb-8">
+          <h1 className="text-2xl sm:text-3xl font-bold text-solar-yellow mb-2">Make a Payment</h1>
+          <p className="text-gray-400 text-sm mb-6">
             Top up your meter balance on the Stellar blockchain.
           </p>
 
@@ -124,20 +124,20 @@ export default function PayPage() {
                 <label className="block text-sm font-medium text-gray-300 mb-2">
                   Billing Plan
                 </label>
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                   {PLANS.map((p) => (
                     <button
                       key={p.value}
                       type="button"
                       onClick={() => setPlan(p.value)}
-                      className={`rounded-lg border px-3 py-2.5 text-left transition ${
+                      className={`rounded-lg border px-3 py-3 text-left transition ${
                         plan === p.value
                           ? "border-solar-yellow bg-solar-yellow/10 text-solar-yellow"
                           : "border-white/10 text-gray-400 hover:border-white/30"
                       }`}
                     >
-                      <div className="text-xs font-semibold">{p.label}</div>
-                      <div className="text-[10px] opacity-70 mt-0.5">{p.desc}</div>
+                      <div className="text-sm font-semibold">{p.label}</div>
+                      <div className="text-xs opacity-70 mt-0.5">{p.desc}</div>
                     </button>
                   ))}
                 </div>
@@ -176,7 +176,7 @@ export default function PayPage() {
               <button
                 type="submit"
                 disabled={status === "loading"}
-                className="w-full rounded-lg bg-solar-yellow py-3 font-semibold text-solar-dark hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition"
+                className="w-full rounded-lg bg-solar-yellow py-3.5 text-base font-semibold text-solar-dark hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition"
               >
                 {status === "loading" ? "Waiting for wallet…" : "Pay Now"}
               </button>
