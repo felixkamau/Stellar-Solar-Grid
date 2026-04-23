@@ -1,61 +1,46 @@
-import { Link } from "react-router-dom";
-import { useWalletStore } from "../store/walletStore";
-import styles from "./Navbar.module.css";
+"use client";
+
+import Link from "next/link";
+import { useWalletStore } from "@/store/walletStore";
 
 export default function Navbar() {
-  const { address, connect, disconnect, error, clearError } = useWalletStore();
+  const { address, connect, disconnect } = useWalletStore();
+
+  const short = address ? `${address.slice(0, 4)}…${address.slice(-4)}` : null;
 
   return (
-    <nav className={styles.nav}>
-      <Link to="/" className={styles.logo}>
+    <nav className="flex items-center justify-between px-6 py-4 bg-solar-accent border-b border-white/10">
+      <Link href="/" className="text-xl font-bold text-solar-yellow">
         ☀️ SolarGrid
       </Link>
-      <div className={styles.links}>
-        <Link to="/dashboard">My Meter</Link>
-        <Link to="/pay">Pay</Link>
-        <Link to="/provider">Provider</Link>
-      </div>
-      <div>
+
+      <div className="flex items-center gap-4">
+        <Link href="/dashboard/user" className="text-sm text-gray-300 hover:text-white transition">
+          My Meter
+        </Link>
+        <Link
+          href="/dashboard/provider"
+          className="text-sm text-gray-300 hover:text-white transition"
+        >
+          Provider
+        </Link>
+
         {address ? (
-          <div className={styles.wallet}>
-            <span className={styles.addr}>
-              {address.slice(0, 6)}…{address.slice(-4)}
-            </span>
-            <button className="btn-danger" onClick={disconnect}>
-              Disconnect
-            </button>
-          </div>
+          <button
+            onClick={disconnect}
+            className="rounded-lg border border-solar-yellow px-4 py-1.5 text-sm text-solar-yellow hover:bg-solar-yellow hover:text-solar-dark transition"
+          >
+            {short}
+          </button>
         ) : (
-          <button className="btn-primary" onClick={connect}>
+          <button
+            onClick={connect}
+            className="rounded-lg bg-solar-yellow px-4 py-1.5 text-sm font-semibold text-solar-dark hover:opacity-90 transition"
+          >
             Connect Wallet
           </button>
         )}
       </div>
-      {error && (
-        <div className={styles.toast}>
-          {error === "no_freighter" ? (
-            <>
-              Freighter wallet not found.{" "}
-              <a
-                href="https://freighter.app"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Install Freighter
-              </a>
-            </>
-          ) : (
-            "Wallet connection failed. Please try again."
-          )}
-          <button
-            className={styles.toastClose}
-            onClick={clearError}
-            aria-label="Dismiss"
-          >
-            ✕
-          </button>
-        </div>
-      )}
     </nav>
   );
 }
