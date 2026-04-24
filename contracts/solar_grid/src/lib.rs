@@ -53,6 +53,7 @@ pub struct SolarGridContract;
 impl SolarGridContract {
     /// Initialize the contract with an admin address.
     pub fn initialize(env: Env, admin: Address, treasury_share: u32) {
+        admin.require_auth();
         if env.storage().instance().has(&ADMIN) {
             panic!("already initialized");
         }
@@ -186,6 +187,10 @@ impl SolarGridContract {
         let key = DataKey::Meter(meter_id.clone());
         let mut meter: Meter = env.storage().persistent().get(&key).expect("meter not found");
         let now = env.ledger().timestamp();
+        // Exhaustive match guard: compile error if a new variant is added without handling it.
+        match plan {
+            PaymentPlan::Daily | PaymentPlan::Weekly | PaymentPlan::UsageBased => {}
+        }
         let expires_at = match plan {
             PaymentPlan::Daily => now.saturating_add(SECONDS_PER_DAY),
             PaymentPlan::Weekly => now.saturating_add(SECONDS_PER_WEEK),
@@ -217,8 +222,22 @@ impl SolarGridContract {
         );
     }
 
-    /// Withdraw collected token revenue from the contract vault.
-    /// Provider is the contract admin set at initialization.
+    /// Withdraw accumulated revenue from the contract vault to the provider address.
+    ///
+    /// Revenue is credited to the admin's `ProviderRevenue` balance on every
+    /// `make_payment` call. This function debits that balance and transfers
+    /// tokens via the SEP-41 token interface.
+    ///
+    /// # Access control
+    /// Only the contract admin may call this (`provider` must equal the stored
+    /// admin and must co-sign the transaction).
+    ///
+    /// # Panics
+    /// - `"amount must be positive"` — if `amount <= 0`
+    /// - `"provider is not admin"` — if caller is not the contract admin
+    /// - `"insufficient provider revenue"` — if tracked balance < `amount`
+    ///
+    /// Emits: `rev_wdrl { provider, token_address, amount }`
     pub fn withdraw_revenue(env: Env, token_address: Address, provider: Address, amount: i128) {
         if amount <= 0 {
             panic!("amount must be positive");
@@ -265,9 +284,7 @@ impl SolarGridContract {
         let key = DataKey::Meter(meter_id.clone());
         let mut meter: Meter = env.storage().persistent().get(&key).expect("meter not found");
         meter.units_used += units;
-        // Clamp to 0: saturating_sub on i128 would bottom out at i128::MIN on
-        // underflow; .max(0) normalises any negative result to exactly 0.
-        meter.balance = meter.balance.saturating_sub(cost).max(0);
+        meter.balance = meter.balance.checked_sub(cost).unwrap_or(0).max(0);
         let deactivated = if meter.balance == 0 {
             meter.active = false;
             true
@@ -305,6 +322,9 @@ impl SolarGridContract {
         Self::require_admin(&env);
         let key = DataKey::Meter(meter_id.clone());
         let mut meter: Meter = env.storage().persistent().get(&key).expect("meter not found");
+        if active && meter.balance == 0 {
+            panic!("cannot activate meter with zero balance");
+        }
         meter.active = active;
         env.storage().persistent().set(&key, &meter);
 
@@ -564,6 +584,74 @@ mod tests {
         assert!(!client.check_access(&meter_id));
     }
 
+    /// Weekly plan should auto-expire after 7 days even with remaining balance.
+    #[test]
+    fn test_check_access_false_when_weekly_plan_expired() {
+        let (env, client, _admin) = setup();
+        let (token_address, token_admin_client, _) = setup_token(&env);
+
+        let user = Address::generate(&env);
+        let meter_id = symbol_short!("WK_EXP");
+
+        allowlist_and_register(&client, &meter_id, &user);
+        token_admin_client.mint(&user, &5_000_000_i128);
+        client.make_payment(&meter_id, &token_address, &user, &5_000_000_i128, &PaymentPlan::Weekly);
+        assert!(client.check_access(&meter_id));
+
+        let meter = client.get_meter(&meter_id);
+        assert_eq!(meter.expires_at - meter.last_payment, SECONDS_PER_WEEK);
+
+        env.ledger().with_mut(|li| li.timestamp = meter.expires_at);
+        assert!(!client.check_access(&meter_id));
+    }
+
+    /// UsageBased plan never expires by time — only balance gates access.
+    #[test]
+    fn test_usage_based_plan_never_expires_by_time() {
+        let (env, client, _admin) = setup();
+        let (token_address, token_admin_client, _) = setup_token(&env);
+
+        let user = Address::generate(&env);
+        let meter_id = symbol_short!("UB_EXP");
+
+        allowlist_and_register(&client, &meter_id, &user);
+        token_admin_client.mint(&user, &1_000_i128);
+        client.make_payment(&meter_id, &token_address, &user, &1_000_i128, &PaymentPlan::UsageBased);
+
+        let meter = client.get_meter(&meter_id);
+        assert_eq!(meter.expires_at, u64::MAX);
+
+        // Far future — still active because balance > 0 and expires_at = u64::MAX
+        env.ledger().with_mut(|li| li.timestamp = u64::MAX - 1);
+        assert!(client.check_access(&meter_id));
+    }
+
+    /// Renewal (top-up) after expiry resets expires_at and restores access.
+    #[test]
+    fn test_renewal_resets_expiry_and_restores_access() {
+        let (env, client, _admin) = setup();
+        let (token_address, token_admin_client, _) = setup_token(&env);
+
+        let user = Address::generate(&env);
+        let meter_id = symbol_short!("RENEW");
+
+        allowlist_and_register(&client, &meter_id, &user);
+        token_admin_client.mint(&user, &4_000_000_i128);
+        client.make_payment(&meter_id, &token_address, &user, &2_000_000_i128, &PaymentPlan::Daily);
+
+        let meter = client.get_meter(&meter_id);
+        // Advance past expiry
+        env.ledger().with_mut(|li| li.timestamp = meter.expires_at);
+        assert!(!client.check_access(&meter_id));
+
+        // Top-up renews the plan from the new timestamp
+        client.make_payment(&meter_id, &token_address, &user, &2_000_000_i128, &PaymentPlan::Daily);
+        assert!(client.check_access(&meter_id));
+
+        let renewed = client.get_meter(&meter_id);
+        assert!(renewed.expires_at > meter.expires_at);
+    }
+
     /// Registering an owner not on the allowlist must panic.
     #[test]
     #[should_panic(expected = "owner not in allowlist")]
@@ -683,6 +771,19 @@ mod tests {
 
     // ── Event emission tests ──────────────────────────────────────────────────
 
+    /// set_active(true) must panic when the meter has zero balance (#86).
+    #[test]
+    #[should_panic(expected = "cannot activate meter with zero balance")]
+    fn test_set_active_true_panics_when_balance_zero() {
+        let (env, client, _admin) = setup();
+        let user = Address::generate(&env);
+        let meter_id = symbol_short!("ZERO_BAL");
+
+        allowlist_and_register(&client, &meter_id, &user);
+        // Meter has balance=0 right after registration — activating must panic.
+        client.set_active(&meter_id, &true);
+    }
+
     #[test]
     fn test_event_meter_registered() {
         let (env, client, _admin) = setup();
@@ -766,5 +867,28 @@ mod tests {
             topics.get(0).map(|v| v.get_payload()) == Some(Val::from_val(&env, &symbol_short!("mtr_deact")).get_payload())
         });
         assert!(has_deact, "mtr_deact event not emitted by set_active(false)");
+    }
+
+    #[test]
+    fn test_event_meter_activated_via_set_active() {
+        let (env, client, _admin) = setup();
+        let (token_address, token_admin_client, _) = setup_token(&env);
+        let user = Address::generate(&env);
+        let meter_id = symbol_short!("EV_ON");
+
+        allowlist_and_register(&client, &meter_id, &user);
+        token_admin_client.mint(&user, &1_000_i128);
+        client.make_payment(&meter_id, &token_address, &user, &1_000_i128, &PaymentPlan::Daily);
+        // Deactivate first so we can re-activate
+        client.set_active(&meter_id, &false);
+
+        client.set_active(&meter_id, &true);
+
+        let events = env.events().all();
+        let has_actv = events.iter().any(|(_, topics, _)| {
+            topics.get(0) == Some(symbol_short!("mtr_actv").into())
+                && topics.get(1) == Some(EVT_NS.into())
+        });
+        assert!(has_actv, "mtr_actv event not emitted by set_active(true)");
     }
 }
