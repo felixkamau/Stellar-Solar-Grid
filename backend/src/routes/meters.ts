@@ -1,6 +1,10 @@
 import { Router } from "express";
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { adminInvoke, contractQuery } from "../lib/stellar.js";
+import {
+  getUsageHistory,
+  persistAndSubmitUsageEvent,
+} from "../lib/usageEvents.js";
 
 export const meterRouter = Router();
 
@@ -23,6 +27,19 @@ meterRouter.get("/:id/access", async (req, res) => {
       StellarSdk.nativeToScVal(req.params.id, { type: "symbol" }),
     ]);
     res.json({ active: StellarSdk.scValToNative(result) });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** GET /api/meters/:id/history — paginated local usage history */
+meterRouter.get("/:id/history", (req, res) => {
+  const page = Math.max(1, Number(req.query.page ?? 1) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 25) || 25));
+
+  try {
+    const history = getUsageHistory(req.params.id, page, pageSize);
+    res.json(history);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -64,12 +81,18 @@ meterRouter.post("/:id/usage", async (req, res) => {
     return res.status(400).json({ error: "units and cost are required" });
   }
   try {
-    const hash = await adminInvoke("update_usage", [
-      StellarSdk.nativeToScVal(req.params.id, { type: "symbol" }),
-      StellarSdk.nativeToScVal(BigInt(units), { type: "u64" }),
-      StellarSdk.nativeToScVal(BigInt(cost), { type: "i128" }),
-    ]);
-    res.json({ hash });
+    const event = await persistAndSubmitUsageEvent({
+      meterId: req.params.id,
+      units,
+      cost,
+      sourceTopic: null,
+    });
+
+    res.json({
+      event,
+      hash: event.on_chain_tx_hash,
+      queued: !event.on_chain_tx_hash,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
