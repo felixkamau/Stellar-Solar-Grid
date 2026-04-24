@@ -91,13 +91,13 @@ impl SolarGridContract {
         env.storage().persistent().set(&key, &meter);
 
         // Append meter_id to the owner's meter list
-        let owner_key = DataKey::OwnerMeters(owner);
+        let owner_key = DataKey::OwnerMeters(owner.clone());
         let mut list: Vec<Symbol> = env
             .storage()
             .persistent()
             .get(&owner_key)
             .unwrap_or_else(|| vec![&env]);
-        list.push_back(meter_id);
+        list.push_back(meter_id.clone());
         env.storage().persistent().set(&owner_key, &list);
 
         // meter_registered
@@ -359,9 +359,13 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         symbol_short,
-        testutils::{Address as _, Ledger},
-        token, Address, Env,
+        testutils::{Address as _, Events, Ledger},
+        token, Address, Env, Symbol, TryFromVal,
     };
+
+    fn sym_eq(env: &Env, val: &soroban_sdk::Val, expected: Symbol) -> bool {
+        Symbol::try_from_val(env, val).ok() == Some(expected)
+    }
 
     fn setup() -> (Env, SolarGridContractClient<'static>, Address) {
         let env = Env::default();
@@ -799,8 +803,8 @@ mod tests {
         let events = env.events().all();
         let found = events.iter().any(|(_, topics, _)| {
             topics.len() >= 2
-                && topics.get(0) == Some(symbol_short!("mtr_reg").into())
-                && topics.get(1) == Some(EVT_NS.into())
+                && topics.get(0).map(|v| sym_eq(&env, &v, symbol_short!("mtr_reg"))).unwrap_or(false)
+                && topics.get(1).map(|v| sym_eq(&env, &v, EVT_NS)).unwrap_or(false)
         });
         assert!(found, "mtr_reg event not emitted");
     }
@@ -818,10 +822,10 @@ mod tests {
 
         let events = env.events().all();
         let has_pmt = events.iter().any(|(_, topics, _)| {
-            topics.get(0) == Some(symbol_short!("pmt_rcvd").into())
+            topics.get(0).map(|v| sym_eq(&env, &v, symbol_short!("pmt_rcvd"))).unwrap_or(false)
         });
         let has_actv = events.iter().any(|(_, topics, _)| {
-            topics.get(0) == Some(symbol_short!("mtr_actv").into())
+            topics.get(0).map(|v| sym_eq(&env, &v, symbol_short!("mtr_actv"))).unwrap_or(false)
         });
         assert!(has_pmt, "pmt_rcvd event not emitted");
         assert!(has_actv, "mtr_actv event not emitted");
@@ -843,10 +847,10 @@ mod tests {
 
         let events = env.events().all();
         let has_usg = events.iter().any(|(_, topics, _)| {
-            topics.get(0) == Some(symbol_short!("usg_upd").into())
+            topics.get(0).map(|v| sym_eq(&env, &v, symbol_short!("usg_upd"))).unwrap_or(false)
         });
         let has_deact = events.iter().any(|(_, topics, _)| {
-            topics.get(0) == Some(symbol_short!("mtr_deact").into())
+            topics.get(0).map(|v| sym_eq(&env, &v, symbol_short!("mtr_deact"))).unwrap_or(false)
         });
         assert!(has_usg, "usg_upd event not emitted");
         assert!(has_deact, "mtr_deact event not emitted on balance drain");
@@ -867,7 +871,7 @@ mod tests {
 
         let events = env.events().all();
         let has_deact = events.iter().any(|(_, topics, _)| {
-            topics.get(0) == Some(symbol_short!("mtr_deact").into())
+            topics.get(0).map(|v| sym_eq(&env, &v, symbol_short!("mtr_deact"))).unwrap_or(false)
         });
         assert!(has_deact, "mtr_deact event not emitted by set_active(false)");
     }
@@ -889,8 +893,8 @@ mod tests {
 
         let events = env.events().all();
         let has_actv = events.iter().any(|(_, topics, _)| {
-            topics.get(0) == Some(symbol_short!("mtr_actv").into())
-                && topics.get(1) == Some(EVT_NS.into())
+            topics.get(0).map(|v| sym_eq(&env, &v, symbol_short!("mtr_actv"))).unwrap_or(false)
+                && topics.get(1).map(|v| sym_eq(&env, &v, EVT_NS)).unwrap_or(false)
         });
         assert!(has_actv, "mtr_actv event not emitted by set_active(true)");
     }
