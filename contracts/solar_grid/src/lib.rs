@@ -9,10 +9,18 @@ use soroban_sdk::{
 #[contracterror]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ContractError {
-    NotInitialized    = 1,
-    MeterAlreadyExists = 2,
-    OracleNotSet      = 3,
-    UnauthorizedOracle = 4,
+    NotInitialized      = 1,
+    AlreadyInitialized  = 2,
+    MeterAlreadyExists  = 3,
+    MeterNotFound       = 4,
+    OracleNotSet        = 5,
+    UnauthorizedOracle  = 6,
+    Unauthorized        = 7,
+    InvalidAmount       = 8,
+    InsufficientBalance = 9,
+    OwnerNotAllowlisted = 10,
+    BatchTooLarge       = 11,
+    CannotActivateZeroBalance = 12,
 }
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
