@@ -391,7 +391,7 @@ impl SolarGridContract {
     pub fn batch_update_usage(env: Env, updates: Vec<(Symbol, u64, i128)>) {
         Self::require_oracle(&env);
         if updates.len() > 50 {
-            panic!("batch too large");
+            env.panic_with_error(ContractError::BatchTooLarge);
         }
         for (meter_id, units, cost) in updates.iter() {
             let key = DataKey::Meter(meter_id.clone());
@@ -460,7 +460,7 @@ impl SolarGridContract {
             let bal_key = DataKey::MeterBalance(meter_id.clone());
             let balance: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
             if balance == 0 {
-                panic!("cannot activate meter with zero balance");
+                env.panic_with_error(ContractError::CannotActivateZeroBalance);
             }
         }
         meter.active = active;
