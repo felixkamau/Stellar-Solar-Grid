@@ -1,5 +1,7 @@
 # Stellar SolarGrid
 
+[![CI](https://github.com/Dev-AdeTutu/Stellar-Solar-Grid/actions/workflows/ci.yml/badge.svg)](https://github.com/Dev-AdeTutu/Stellar-Solar-Grid/actions/workflows/ci.yml)
+
 > Powering Africa with affordable, pay-as-you-go solar energy on blockchain.
 
 Stellar SolarGrid is a decentralized PAYG solar energy platform built on [Soroban](https://soroban.stellar.org), within the Stellar ecosystem. Households and small businesses in underserved regions access solar electricity through flexible micro-payments — no large upfront costs required.
@@ -72,46 +74,38 @@ The `SolarGrid` contract manages:
 | `get_usage(meter_id)` | Retrieve usage data |
 | `update_usage(meter_id, units)` | Called by IoT oracle to update consumption |
 
-### Contract Error Codes
+## Contract Upgrades
 
-| Code | Error | Meaning |
-|---|---|---|
-| `1` | `NotInitialized` | Admin/token configuration has not been set |
-| `2` | `AlreadyInitialized` | Constructor or `initialize` was called more than once |
-| `3` | `MeterNotFound` | Requested meter does not exist |
-| `4` | `MeterAlreadyExists` | A meter with the same ID is already registered |
-| `5` | `Unauthorized` | Caller is not allowed to perform the action |
-| `6` | `InvalidAmount` | Amount or cost argument is invalid |
-| `7` | `InsufficientBalance` | Meter/provider balance is too low for the operation |
+The `Meter` struct carries a `version: u32` field (currently `1`). When the struct layout changes in a future release, existing persistent storage entries must be migrated before they can be read by the new code.
 
-### Backend Usage Event Schema
+### Migration flow
 
-The local `usage_events` SQLite table powers retry and analytics:
+1. Deploy the new contract WASM (the old entries remain in persistent storage).
+2. For each registered meter, call the admin-only `migrate_meter(meter_id)` function.  
+   It reads the entry as the previous schema (`LegacyMeter`) and writes it back as the current `Meter` v1.
+3. Once all entries are migrated, the `LegacyMeter` type and `migrate_meter_v0` helper can be removed in a subsequent release.
 
-| Column | Type | Notes |
-|---|---|---|
-| `id` | `INTEGER` | Primary key |
-| `meter_id` | `TEXT` | Contract meter symbol |
-| `units` | `INTEGER` | Usage units reported by the meter |
-| `cost` | `TEXT` | Charged amount, stored as text to preserve large integer values |
-| `received_at` | `TEXT` | ISO timestamp when the backend accepted the event |
-| `source_topic` | `TEXT` | MQTT topic if the event came from the broker |
-| `status` | `TEXT` | `pending`, `submitted`, or `failed` |
-| `attempt_count` | `INTEGER` | Number of on-chain submission attempts |
-| `last_attempt_at` | `TEXT` | ISO timestamp of the last retry |
-| `last_error` | `TEXT` | Last submission error message |
-| `on_chain_tx_hash` | `TEXT` | Soroban transaction hash after success |
-| `submitted_at` | `TEXT` | ISO timestamp when on-chain submission succeeded |
+```bash
+# Example: migrate a single meter via Stellar CLI
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source <ADMIN_SECRET> \
+  --network testnet \
+  -- migrate_meter --meter_id METER1
+```
 
-### Meter History API
-
-`GET /api/meters/:id/history?page=1&pageSize=25`
-
-Returns paginated usage events from the local SQLite store so dashboards can query recent history without rebuilding it from on-chain events. Events are written locally before on-chain submission, and failed submissions are retried up to 3 times by the backend worker.
+> **Note:** `migrate_meter` is idempotent per entry — calling it on an already-migrated meter will overwrite with the same data. Always test migrations on testnet before mainnet.
 
 ## Network
 
 Deployed on Stellar Testnet. Switch to Mainnet for production.
+
+## Deployment Security
+
+- **Never commit `.env` files.** Copy `.env.example` to `.env` and populate locally.
+- `ADMIN_SECRET_KEY` is loaded once at backend startup into a `Keypair` object; the raw secret string is not referenced anywhere after module initialisation.
+- All error handlers log only `err.message` — raw error objects (which may contain XDR or serialised environment variables) are never logged.
+- Enable secret scanning in CI (e.g. `git-secrets`, GitHub secret scanning) to prevent accidental key commits.
 
 ## License
 
