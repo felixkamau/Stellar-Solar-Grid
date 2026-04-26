@@ -510,6 +510,89 @@ impl SolarGridContract {
         Ok(())
     }
 
+    // ── Collaborator management ───────────────────────────────────────────────
+
+    /// Add a collaborator with a share in basis points (100 = 1%).
+    /// Total shares across all collaborators must not exceed 10 000 (100%).
+    pub fn add_collaborator(env: Env, collaborator: Address, basis_points: u32) {
+        Self::require_admin(&env);
+        if basis_points == 0 || basis_points > 10_000 {
+            panic!("basis_points must be between 1 and 10000");
+        }
+
+        let mut collabs: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&COLLABS)
+            .unwrap_or(Vec::new(&env));
+        let mut shares: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&SHARES)
+            .unwrap_or(Map::new(&env));
+
+        if shares.contains_key(collaborator.clone()) {
+            panic!("collaborator already added");
+        }
+
+        // Guard against total exceeding 100%
+        let total: u32 = shares.values().iter().sum();
+        if total + basis_points > 10_000 {
+            panic!("total shares would exceed 100%");
+        }
+
+        collabs.push_back(collaborator.clone());
+        shares.set(collaborator, basis_points);
+
+        env.storage().instance().set(&COLLABS, &collabs);
+        env.storage().instance().set(&SHARES, &shares);
+    }
+
+    /// Returns collaborator addresses in insertion order.
+    pub fn get_collaborators(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&COLLABS)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns the full share map in a single call — eliminates N+1 RPC calls.
+    /// Map<Address, u32> where u32 is basis points (100 = 1%).
+    pub fn get_all_shares(env: Env) -> Map<Address, u32> {
+        env.storage()
+            .instance()
+            .get(&SHARES)
+            .unwrap_or(Map::new(&env))
+    }
+
+    /// Distribute `amount` stroops among collaborators proportionally.
+    /// Iterates the ordered Vec and looks up shares from the Map.
+    pub fn distribute(env: Env, amount: i128) -> Map<Address, i128> {
+        Self::require_admin(&env);
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+
+        let collabs: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&COLLABS)
+            .unwrap_or(Vec::new(&env));
+        let shares: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&SHARES)
+            .unwrap_or(Map::new(&env));
+
+        let mut result: Map<Address, i128> = Map::new(&env);
+        for collaborator in collabs.iter() {
+            let bp = shares.get(collaborator.clone()).unwrap_or(0) as i128;
+            let payout = (amount * bp) / 10_000;
+            result.set(collaborator, payout);
+        }
+        result
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn write_initial_config(
@@ -1424,5 +1507,63 @@ mod tests {
         assert_eq!(meter.plan, PaymentPlan::UsageBased);
         assert_eq!(meter.last_payment, 1_000);
         assert_eq!(meter.expires_at, u64::MAX);
+    }
+
+    /// get_all_shares returns the full map in one call.
+    #[test]
+    fn test_get_all_shares_single_call() {
+        let (env, client, _admin) = setup();
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.add_collaborator(&alice, &6_000_u32); // 60%
+        client.add_collaborator(&bob, &4_000_u32);   // 40%
+
+        let shares = client.get_all_shares();
+        assert_eq!(shares.get(alice.clone()).unwrap(), 6_000);
+        assert_eq!(shares.get(bob.clone()).unwrap(), 4_000);
+
+        // get_collaborators preserves insertion order
+        let collabs = client.get_collaborators();
+        assert_eq!(collabs.get(0).unwrap(), alice);
+        assert_eq!(collabs.get(1).unwrap(), bob);
+    }
+
+    /// distribute splits amount proportionally using insertion-ordered Vec.
+    #[test]
+    fn test_distribute_proportional() {
+        let (env, client, _admin) = setup();
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.add_collaborator(&alice, &7_500_u32); // 75%
+        client.add_collaborator(&bob, &2_500_u32);   // 25%
+
+        let payouts = client.distribute(&10_000_000_i128);
+        assert_eq!(payouts.get(alice).unwrap(), 7_500_000);
+        assert_eq!(payouts.get(bob).unwrap(), 2_500_000);
+    }
+
+    /// Adding a duplicate collaborator should panic.
+    #[test]
+    #[should_panic(expected = "collaborator already added")]
+    fn test_add_collaborator_duplicate_panics() {
+        let (env, client, _admin) = setup();
+        let alice = Address::generate(&env);
+        client.add_collaborator(&alice, &5_000_u32);
+        client.add_collaborator(&alice, &5_000_u32);
+    }
+
+    /// Total shares exceeding 100% should panic.
+    #[test]
+    #[should_panic(expected = "total shares would exceed 100%")]
+    fn test_add_collaborator_overflow_panics() {
+        let (env, client, _admin) = setup();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        client.add_collaborator(&alice, &6_000_u32);
+        client.add_collaborator(&bob, &5_000_u32); // 60 + 50 > 100%
     }
 }
