@@ -1,27 +1,38 @@
 /**
  * IoT Bridge — two responsibilities:
  *
- * 1. MQTT: subscribes to smart meter usage topics and records consumption
- *    on-chain via the admin keypair.
+ * Readings are buffered per flush interval and submitted as a single
+ * batch_update_usage call to minimise transaction overhead.
  *
- * 2. Contract events: polls Soroban RPC for contract events and reacts
- *    to payment_received, meter_activated, and meter_deactivated.
- *
- * MQTT topic:  solargrid/meters/{meter_id}/usage
- * Payload:     { "units": 100, "cost": 500000 }
+ * Expected MQTT topic:  solargrid/meters/{meter_id}/usage
+ * Expected payload:     { "units": 100, "cost": 500000 }
  */
 
 import mqtt from "mqtt";
-import * as StellarSdk from "@stellar/stellar-sdk";
-import { adminInvoke, CONTRACT_ID, server } from "../lib/stellar.js";
+import { persistAndSubmitUsageEvent } from "../lib/usageEvents.js";
 
 const BROKER = process.env.MQTT_BROKER ?? "mqtt://localhost:1883";
-const MQTT_TOPIC = "solargrid/meters/+/usage";
+const TOPIC = "solargrid/meters/+/usage";
+const FLUSH_INTERVAL_MS = Number(process.env.BATCH_FLUSH_MS ?? 5_000);
+const EVENT_POLL_INTERVAL_MS = Number(process.env.EVENT_POLL_INTERVAL_MS ?? 5_000);
 
-// How often to poll for new contract events (ms)
-const EVENT_POLL_INTERVAL_MS = 5_000;
+interface Reading {
+  meterId: string;
+  units: number;
+  cost: number;
+}
 
-// ── MQTT bridge ───────────────────────────────────────────────────────────────
+/** Encode a batch of readings as a Soroban Vec<(Symbol, u64, i128)>. */
+function encodeBatch(readings: Reading[]): StellarSdk.xdr.ScVal {
+  const entries = readings.map(({ meterId, units, cost }) =>
+    StellarSdk.xdr.ScVal.scvVec([
+      StellarSdk.nativeToScVal(meterId, { type: "symbol" }),
+      StellarSdk.nativeToScVal(BigInt(units), { type: "u64" }),
+      StellarSdk.nativeToScVal(BigInt(cost), { type: "i128" }),
+    ])
+  );
+  return StellarSdk.xdr.ScVal.scvVec(entries);
+}
 
 export function startIoTBridge() {
   startMqttBridge();
@@ -30,19 +41,33 @@ export function startIoTBridge() {
 
 function startMqttBridge() {
   const client = mqtt.connect(BROKER);
+  let pending: Reading[] = [];
+
+  const flush = async () => {
+    if (pending.length === 0) return;
+    const batch = pending.splice(0);
+    logger.info(`Flushing batch of ${batch.length} meter update(s)`);
+    try {
+      const hash = await adminInvoke("batch_update_usage", [encodeBatch(batch)]);
+      logger.info(`Batch recorded on-chain: ${hash}`);
+    } catch (err) {
+      logger.error("Batch submission error", { err });
+    }
+  };
+
+  setInterval(flush, FLUSH_INTERVAL_MS);
 
   client.on("connect", () => {
-    console.log(`📡 IoT bridge connected to ${BROKER}`);
-    client.subscribe(MQTT_TOPIC, (err) => {
-      if (err) console.error("MQTT subscribe error:", err);
+    logger.info(`IoT bridge connected to ${BROKER}`);
+    client.subscribe(TOPIC, (err) => {
+      if (err) logger.error("MQTT subscribe error", { err });
     });
   });
 
-  client.on("message", async (topic, payload) => {
+  client.on("message", (topic, payload) => {
+    mqttMessages.inc();
     try {
-      // Extract meter_id from topic: solargrid/meters/{meter_id}/usage
-      const parts = topic.split("/");
-      const meterId = parts[2];
+      const meterId = topic.split("/")[2];
       const { units, cost } = JSON.parse(payload.toString()) as {
         units: number;
         cost: number;
@@ -50,20 +75,25 @@ function startMqttBridge() {
 
       console.log(`⚡ Usage update — meter: ${meterId}, units: ${units}, cost: ${cost}`);
 
-      const hash = await adminInvoke("update_usage", [
-        StellarSdk.nativeToScVal(meterId, { type: "symbol" }),
-        StellarSdk.nativeToScVal(BigInt(units), { type: "u64" }),
-        StellarSdk.nativeToScVal(BigInt(cost), { type: "i128" }),
-      ]);
+      const event = await persistAndSubmitUsageEvent({
+        meterId,
+        units,
+        cost,
+        sourceTopic: topic,
+      });
 
-      console.log(`✅ Usage recorded on-chain: ${hash}`);
+      if (event.on_chain_tx_hash) {
+        console.log(`✅ Usage recorded on-chain: ${event.on_chain_tx_hash}`);
+      } else {
+        console.warn(`⏳ Usage event ${event.id} queued for retry`);
+      }
     } catch (err) {
-      console.error("IoT bridge error:", err);
+      logger.error("IoT bridge parse error", { err });
     }
   });
 
   client.on("error", (err) => {
-    console.warn("MQTT connection error (will retry):", err.message);
+    logger.warn("MQTT connection error (will retry)", { message: err.message });
   });
 }
 
@@ -112,13 +142,10 @@ async function pollContractEvents() {
 }
 
 async function handleContractEvent(
-  event: StellarSdk.SorobanRpc.Api.RawEventResponse,
+  event: StellarSdk.SorobanRpc.Api.EventResponse,
 ) {
   try {
-    // Topics are XDR-encoded ScVals — first topic is the event name tuple
-    const topics = event.topic.map((t) =>
-      StellarSdk.xdr.ScVal.fromXDR(t, "base64"),
-    );
+    const topics = event.topic;
 
     if (topics.length < 2) return;
 
@@ -131,7 +158,7 @@ async function handleContractEvent(
 
     switch (eventKey) {
       case "payment:received": {
-        const data = StellarSdk.xdr.ScVal.fromXDR(event.value, "base64");
+        const data = event.value;
         const native = StellarSdk.scValToNative(data) as [string, bigint, unknown];
         const [meterId, amount] = native;
         console.log(
@@ -142,7 +169,7 @@ async function handleContractEvent(
       }
 
       case "meter:activated": {
-        const data = StellarSdk.xdr.ScVal.fromXDR(event.value, "base64");
+        const data = event.value;
         const meterId = String(StellarSdk.scValToNative(data));
         console.log(`✅ meter_activated — meter: ${meterId}`);
         await onMeterActivated(meterId);
@@ -150,7 +177,7 @@ async function handleContractEvent(
       }
 
       case "meter:deactivated": {
-        const data = StellarSdk.xdr.ScVal.fromXDR(event.value, "base64");
+        const data = event.value;
         const meterId = String(StellarSdk.scValToNative(data));
         console.log(`🔴 meter_deactivated — meter: ${meterId}`);
         await onMeterDeactivated(meterId);

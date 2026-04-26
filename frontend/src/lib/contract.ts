@@ -1,53 +1,37 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
+import { useWalletStore } from "@/store/walletStore";
 
-export const NETWORK_PASSPHRASE =
-  process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE ?? StellarSdk.Networks.TESTNET;
-export const RPC_URL =
-  process.env.NEXT_PUBLIC_RPC_URL ?? "https://soroban-testnet.stellar.org";
-export const CONTRACT_ID = process.env.NEXT_PUBLIC_CONTRACT_ID ?? "";
-
-/**
- * Project-controlled funded account used as the fee source for read-only
- * simulations when no wallet is connected. Set this in .env.local.
- * Never hardcode a public key here — testnet resets can defund any account.
- */
-const FEE_SOURCE_ADDRESS = process.env.NEXT_PUBLIC_FEE_SOURCE_ADDRESS ?? "";
-
-const STROOPS_PER_XLM = 10_000_000;
-const MILLI_KWH_PER_KWH = 1_000;
+const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL!;
+const CONTRACT_ID = process.env.NEXT_PUBLIC_CONTRACT_ID!;
+const NETWORK_PASSPHRASE = process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE!;
 
 const server = new StellarSdk.SorobanRpc.Server(RPC_URL);
 
-/**
- * Read-only contract simulation (no auth needed).
- *
- * @param method   Contract function name
- * @param args     ScVal arguments
- * @param sourceAddress  Optional — use the connected wallet address when
- *                 available. Falls back to NEXT_PUBLIC_FEE_SOURCE_ADDRESS.
- *                 Passing an address that exists on-chain avoids failures
- *                 caused by hardcoded or unfunded accounts after testnet resets.
- */
-export async function contractQuery(
-  method: string,
-  args: StellarSdk.xdr.ScVal[],
-  sourceAddress?: string,
-): Promise<StellarSdk.xdr.ScVal> {
-  const source = sourceAddress ?? FEE_SOURCE_ADDRESS;
-  if (!source) {
-    throw new Error(
-      "No fee source address available. Connect your wallet or set NEXT_PUBLIC_FEE_SOURCE_ADDRESS in .env.local.",
-    );
-  }
+export interface MeterData {
+  owner: string;
+  active: boolean;
+  balance: bigint;
+  units_used: bigint;
+  plan: string;
+  last_payment: bigint;
+}
 
+export async function fetchMeter(meterId: string): Promise<MeterData> {
   const contract = new StellarSdk.Contract(CONTRACT_ID);
-  const account = await server.getAccount(source);
+  // Use a throwaway keypair for read-only simulation
+  const keypair = StellarSdk.Keypair.random();
+  const account = new StellarSdk.Account(keypair.publicKey(), "0");
 
   const tx = new StellarSdk.TransactionBuilder(account, {
     fee: "100",
     networkPassphrase: NETWORK_PASSPHRASE,
   })
-    .addOperation(contract.call(method, ...args))
+    .addOperation(
+      contract.call(
+        "get_meter",
+        StellarSdk.nativeToScVal(meterId, { type: "symbol" })
+      )
+    )
     .setTimeout(30)
     .build();
 
@@ -55,47 +39,20 @@ export async function contractQuery(
   if (StellarSdk.SorobanRpc.Api.isSimulationError(sim)) {
     throw new Error(sim.error);
   }
-  return (sim as StellarSdk.SorobanRpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-}
-
-export interface MeterData {
-  active: boolean;
-  balance: number; // XLM
-  unitsUsed: number; // kWh
-  plan: string;
+  const retval = (sim as StellarSdk.SorobanRpc.Api.SimulateTransactionSuccessResponse).result?.retval;
+  if (!retval) throw new Error("No result from contract");
+  return StellarSdk.scValToNative(retval) as MeterData;
 }
 
 /**
- * Fetch and parse a meter from the contract.
- * Pass the connected wallet address so simulation never relies on a
- * hardcoded or potentially unfunded account.
+ * Build, simulate, sign (via connected wallet), and submit a contract call.
+ * Throws raw errors — callers should wrap with parseWalletError().
  */
-export async function fetchMeter(
-  meterId: string,
-  sourceAddress?: string,
-): Promise<MeterData> {
-  const raw = await contractQuery(
-    "get_meter",
-    [StellarSdk.nativeToScVal(meterId, { type: "symbol" })],
-    sourceAddress,
-  );
-  const native = StellarSdk.scValToNative(raw) as Record<string, unknown>;
-
-  const balance = Number(native.balance as bigint) / STROOPS_PER_XLM;
-  const unitsUsed = Number(native.units_used as bigint) / MILLI_KWH_PER_KWH;
-  const planRaw = native.plan as Record<string, unknown>;
-  const plan = Object.keys(planRaw)[0] ?? "Unknown";
-
-  return { active: native.active as boolean, balance: Math.max(0, balance), unitsUsed, plan };
-}
-
-/** Sign and submit a contract transaction via Freighter. */
 export async function contractInvoke(
   sourceAddress: string,
   method: string,
-  args: StellarSdk.xdr.ScVal[],
+  args: StellarSdk.xdr.ScVal[]
 ): Promise<string> {
-  const freighter = (window as unknown as { freighter: any }).freighter;
   const contract = new StellarSdk.Contract(CONTRACT_ID);
   const account = await server.getAccount(sourceAddress);
 
@@ -113,12 +70,44 @@ export async function contractInvoke(
   }
 
   tx = StellarSdk.SorobanRpc.assembleTransaction(tx, sim).build();
-  const signed = await freighter.signTransaction(tx.toXDR(), {
-    networkPassphrase: NETWORK_PASSPHRASE,
-  });
 
-  const result = await server.sendTransaction(
-    StellarSdk.TransactionBuilder.fromXDR(signed, NETWORK_PASSPHRASE),
-  );
+  // Sign via wallet (Freighter rejection throws here)
+  const { signTransaction } = useWalletStore.getState();
+  const signedXdr = await signTransaction(tx.toXDR());
+
+  const signedTx = StellarSdk.TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+  const result = await server.sendTransaction(signedTx);
+
+  if (result.status === "ERROR") {
+    throw new Error(`Transaction failed: ${result.errorResult}`);
+  }
   return result.hash;
+}
+
+/** Return all meter IDs registered under the given owner address. */
+export async function fetchMetersByOwner(ownerAddress: string): Promise<string[]> {
+  const contract = new StellarSdk.Contract(CONTRACT_ID);
+  const keypair = StellarSdk.Keypair.random();
+  const account = new StellarSdk.Account(keypair.publicKey(), "0");
+
+  const tx = new StellarSdk.TransactionBuilder(account, {
+    fee: "100",
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(
+      contract.call(
+        "get_meters_by_owner",
+        StellarSdk.nativeToScVal(ownerAddress, { type: "address" })
+      )
+    )
+    .setTimeout(30)
+    .build();
+
+  const sim = await server.simulateTransaction(tx);
+  if (StellarSdk.SorobanRpc.Api.isSimulationError(sim)) {
+    throw new Error(sim.error);
+  }
+  const retval = (sim as StellarSdk.SorobanRpc.Api.SimulateTransactionSuccessResponse).result?.retval;
+  if (!retval) return [];
+  return StellarSdk.scValToNative(retval) as string[];
 }
