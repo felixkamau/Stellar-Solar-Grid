@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
-    Symbol, Vec,
+    Map, Symbol, Vec,
 };
 
 // ── Error types ───────────────────────────────────────────────────────────────
@@ -21,6 +21,7 @@ pub enum ContractError {
     InsufficientProviderRevenue = 9,
     BatchTooLarge = 10,
     CannotActivateWithoutBalance = 11,
+    InsufficientBalance = 12,
 }
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -30,6 +31,8 @@ const ALLOWLIST: Symbol = symbol_short!("ALLOWLIST");
 const TOKEN: Symbol = symbol_short!("TOKEN");
 const ORACLE: Symbol = symbol_short!("ORACLE");
 const METER_LIST: Symbol = symbol_short!("MLIST");
+const COLLABS: Symbol = symbol_short!("COLLABS");
+const SHARES: Symbol = symbol_short!("SHARES");
 const SECONDS_PER_DAY: u64 = 86_400;
 const SECONDS_PER_WEEK: u64 = 604_800;
 
@@ -90,18 +93,6 @@ pub enum DataKey {
     OwnerMeters(Address),
 }
 
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub enum ContractError {
-    NotInitialized = 1,
-    AlreadyInitialized = 2,
-    MeterNotFound = 3,
-    MeterAlreadyExists = 4,
-    Unauthorized = 5,
-    InvalidAmount = 6,
-    InsufficientBalance = 7,
-}
-
 // ── Event topics (contract namespace) ────────────────────────────────────────
 
 const EVT_NS: Symbol = symbol_short!("solargrid");
@@ -148,7 +139,7 @@ impl SolarGridContract {
     ///   consent to being the meter owner.
     pub fn register_meter(env: Env, meter_id: Symbol, owner: Address) -> Result<(), ContractError> {
         Self::require_admin(&env)?;
-        let allowlist = Self::get_allowlist(env.clone());
+        let allowlist = Self::get_allowlist(env.clone())?;
         if !allowlist.contains(&owner) {
             return Err(ContractError::Unauthorized);
         }
@@ -419,6 +410,10 @@ impl SolarGridContract {
         cost: i128,
     ) -> Result<(), ContractError> {
         Self::require_admin(&env)?;
+        let oracle: Option<Address> = env.storage().instance().get(&ORACLE);
+        if oracle.is_none() {
+            return Err(ContractError::OracleNotSet);
+        }
         if cost < 0 {
             return Err(ContractError::InvalidAmount);
         }
@@ -508,6 +503,90 @@ impl SolarGridContract {
         Ok(())
     }
 
+    // ── Collaborator management ───────────────────────────────────────────────
+
+    /// Add a collaborator with a share in basis points (100 = 1%).
+    /// Total shares across all collaborators must not exceed 10 000 (100%).
+    pub fn add_collaborator(env: Env, collaborator: Address, basis_points: u32) -> Result<(), ContractError> {
+        Self::require_admin(&env)?;
+        if basis_points == 0 || basis_points > 10_000 {
+            panic!("basis_points must be between 1 and 10000");
+        }
+
+        let mut collabs: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&COLLABS)
+            .unwrap_or(Vec::new(&env));
+        let mut shares: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&SHARES)
+            .unwrap_or(Map::new(&env));
+
+        if shares.contains_key(collaborator.clone()) {
+            panic!("collaborator already added");
+        }
+
+        // Guard against total exceeding 100%
+        let total: u32 = shares.values().iter().sum();
+        if total + basis_points > 10_000 {
+            panic!("total shares would exceed 100%");
+        }
+
+        collabs.push_back(collaborator.clone());
+        shares.set(collaborator, basis_points);
+
+        env.storage().instance().set(&COLLABS, &collabs);
+        env.storage().instance().set(&SHARES, &shares);
+        Ok(())
+    }
+
+    /// Returns collaborator addresses in insertion order.
+    pub fn get_collaborators(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&COLLABS)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns the full share map in a single call — eliminates N+1 RPC calls.
+    /// Map<Address, u32> where u32 is basis points (100 = 1%).
+    pub fn get_all_shares(env: Env) -> Map<Address, u32> {
+        env.storage()
+            .instance()
+            .get(&SHARES)
+            .unwrap_or(Map::new(&env))
+    }
+
+    /// Distribute `amount` stroops among collaborators proportionally.
+    /// Iterates the ordered Vec and looks up shares from the Map.
+    pub fn distribute(env: Env, amount: i128) -> Result<Map<Address, i128>, ContractError> {
+        Self::require_admin(&env)?;
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+
+        let collabs: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&COLLABS)
+            .unwrap_or(Vec::new(&env));
+        let shares: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&SHARES)
+            .unwrap_or(Map::new(&env));
+
+        let mut result: Map<Address, i128> = Map::new(&env);
+        for collaborator in collabs.iter() {
+            let bp = shares.get(collaborator.clone()).unwrap_or(0) as i128;
+            let payout = (amount * bp) / 10_000;
+            result.set(collaborator, payout);
+        }
+        Ok(result)
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn write_initial_config(
@@ -547,6 +626,79 @@ impl SolarGridContract {
     fn require_admin(env: &Env) -> Result<(), ContractError> {
         let admin = Self::get_admin(env)?;
         admin.require_auth();
+        Ok(())
+    }
+
+    fn require_initialized(env: &Env) -> Result<(), ContractError> {
+        if !env.storage().instance().has(&ADMIN) {
+            return Err(ContractError::NotInitialized);
+        }
+        Ok(())
+    }
+
+    /// Batch update usage for multiple meters in a single transaction.
+    /// Skips invalid meter IDs and emits a batch_skip event for each.
+    /// Maximum batch size is 50 meters.
+    pub fn batch_update_usage(
+        env: Env,
+        updates: Vec<(Symbol, u64, i128)>,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env)?;
+        let oracle: Option<Address> = env.storage().instance().get(&ORACLE);
+        if oracle.is_none() {
+            return Err(ContractError::OracleNotSet);
+        }
+        if updates.len() > 50 {
+            panic!("batch too large");
+        }
+        for (meter_id, units, cost) in updates.iter() {
+            let key = DataKey::Meter(meter_id.clone());
+            if !env.storage().persistent().has(&key) {
+                env.events().publish(
+                    (symbol_short!("btch_skip"), EVT_NS, meter_id.clone()),
+                    (),
+                );
+                continue;
+            }
+            let mut meter: Meter = env.storage().persistent().get(&key).unwrap();
+            let bal_key = DataKey::MeterBalance(meter_id.clone());
+            let balance: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+            let new_balance = balance.saturating_sub(cost).max(0);
+            env.storage().persistent().set(&bal_key, &new_balance);
+            meter.units_used = meter.units_used.saturating_add(units);
+            let deactivated = if new_balance == 0 {
+                meter.active = false;
+                true
+            } else {
+                false
+            };
+            env.storage().persistent().set(&key, &meter);
+            env.events().publish(
+                (symbol_short!("usg_upd"), EVT_NS, meter_id.clone()),
+                (units, cost),
+            );
+            if deactivated {
+                env.events().publish(
+                    (symbol_short!("mtr_deact"), EVT_NS, meter_id.clone()),
+                    (),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Migrate a meter from v0 (LegacyMeter) to v1 (Meter) schema.
+    /// Admin-only. Idempotent — safe to call on already-migrated meters.
+    pub fn migrate_meter(env: Env, meter_id: Symbol) -> Result<(), ContractError> {
+        Self::require_admin(&env)?;
+        let key = DataKey::Meter(meter_id);
+        let legacy: LegacyMeter = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::MeterNotFound)?;
+        let migrated = migrate_meter_v0(legacy);
+        env.storage().persistent().set(&key, &migrated);
         Ok(())
     }
 }
@@ -1253,9 +1405,24 @@ mod tests {
         register_and_fund(&env, &client, &token_address, &meter_id, 1_000_000_i128);
 
         let mut updates: soroban_sdk::Vec<(Symbol, u64, i128)> = soroban_sdk::Vec::new(&env);
-        for i in 0..51 {
-            let id = Symbol::new(&env, &format!("M{}", i));
-            updates.push_back((id, 1_u64, 100_i128));
+        // Create 51 unique meter IDs using symbol_short with different names
+        let ids = [
+            symbol_short!("M0"), symbol_short!("M1"), symbol_short!("M2"), symbol_short!("M3"),
+            symbol_short!("M4"), symbol_short!("M5"), symbol_short!("M6"), symbol_short!("M7"),
+            symbol_short!("M8"), symbol_short!("M9"), symbol_short!("MA"), symbol_short!("MB"),
+            symbol_short!("MC"), symbol_short!("MD"), symbol_short!("ME"), symbol_short!("MF"),
+            symbol_short!("MG"), symbol_short!("MH"), symbol_short!("MI"), symbol_short!("MJ"),
+            symbol_short!("MK"), symbol_short!("ML"), symbol_short!("MM"), symbol_short!("MN"),
+            symbol_short!("MO"), symbol_short!("MP"), symbol_short!("MQ"), symbol_short!("MR"),
+            symbol_short!("MS"), symbol_short!("MT"), symbol_short!("MU"), symbol_short!("MV"),
+            symbol_short!("MW"), symbol_short!("MX"), symbol_short!("MY"), symbol_short!("MZ"),
+            symbol_short!("N0"), symbol_short!("N1"), symbol_short!("N2"), symbol_short!("N3"),
+            symbol_short!("N4"), symbol_short!("N5"), symbol_short!("N6"), symbol_short!("N7"),
+            symbol_short!("N8"), symbol_short!("N9"), symbol_short!("NA"), symbol_short!("NB"),
+            symbol_short!("NC"), symbol_short!("ND"), symbol_short!("NE"),
+        ];
+        for id in ids.iter() {
+            updates.push_back((id.clone(), 1_u64, 100_i128));
         }
         client.batch_update_usage(&updates);
     }
@@ -1417,5 +1584,63 @@ mod tests {
         assert_eq!(meter.plan, PaymentPlan::UsageBased);
         assert_eq!(meter.last_payment, 1_000);
         assert_eq!(meter.expires_at, u64::MAX);
+    }
+
+    /// get_all_shares returns the full map in one call.
+    #[test]
+    fn test_get_all_shares_single_call() {
+        let (env, client, _admin) = setup();
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.add_collaborator(&alice, &6_000_u32); // 60%
+        client.add_collaborator(&bob, &4_000_u32);   // 40%
+
+        let shares = client.get_all_shares();
+        assert_eq!(shares.get(alice.clone()).unwrap(), 6_000);
+        assert_eq!(shares.get(bob.clone()).unwrap(), 4_000);
+
+        // get_collaborators preserves insertion order
+        let collabs = client.get_collaborators();
+        assert_eq!(collabs.get(0).unwrap(), alice);
+        assert_eq!(collabs.get(1).unwrap(), bob);
+    }
+
+    /// distribute splits amount proportionally using insertion-ordered Vec.
+    #[test]
+    fn test_distribute_proportional() {
+        let (env, client, _admin) = setup();
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.add_collaborator(&alice, &7_500_u32); // 75%
+        client.add_collaborator(&bob, &2_500_u32);   // 25%
+
+        let payouts = client.distribute(&10_000_000_i128);
+        assert_eq!(payouts.get(alice).unwrap(), 7_500_000);
+        assert_eq!(payouts.get(bob).unwrap(), 2_500_000);
+    }
+
+    /// Adding a duplicate collaborator should panic.
+    #[test]
+    #[should_panic(expected = "collaborator already added")]
+    fn test_add_collaborator_duplicate_panics() {
+        let (env, client, _admin) = setup();
+        let alice = Address::generate(&env);
+        client.add_collaborator(&alice, &5_000_u32);
+        client.add_collaborator(&alice, &5_000_u32);
+    }
+
+    /// Total shares exceeding 100% should panic.
+    #[test]
+    #[should_panic(expected = "total shares would exceed 100%")]
+    fn test_add_collaborator_overflow_panics() {
+        let (env, client, _admin) = setup();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        client.add_collaborator(&alice, &6_000_u32);
+        client.add_collaborator(&bob, &5_000_u32); // 60 + 50 > 100%
     }
 }
