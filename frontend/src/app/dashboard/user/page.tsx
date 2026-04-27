@@ -114,6 +114,7 @@ function buildUsageHistory(meters: Record<string, MeterData>): UsageDataPoint[] 
 
 export default function UserDashboardPage() {
   const { address, connect } = useWalletStore();
+  const { showToast } = useToast();
 
   const [meterIds, setMeterIds] = useState<string[]>([]);
   const [meters, setMeters] = useState<Record<string, MeterData>>({});
@@ -134,11 +135,17 @@ export default function UserDashboardPage() {
       setMeters(Object.fromEntries(entries));
       setLastRefresh(new Date());
     } catch (err: unknown) {
-      setError(parseWalletError(err));
+      const friendly = parseWalletError(err);
+      setError(friendly);
+      showToast({
+        variant: "error",
+        title: "Failed to load meters",
+        description: friendly,
+      });
     } finally {
       setLoading(false);
     }
-  }, [address]);
+  }, [address, showToast]);
 
   useEffect(() => {
     if (!address) {
@@ -205,9 +212,9 @@ export default function UserDashboardPage() {
 
         {/* Loading skeleton */}
         {address && loading && meterIds.length === 0 && (
-          <div className="space-y-4 animate-pulse">
+          <div className="space-y-4">
             {[0, 1].map((i) => (
-              <div key={i} className="rounded-xl border border-white/10 bg-solar-accent p-5 h-36" />
+              <SkeletonCard key={i} height={160} />
             ))}
           </div>
         )}
@@ -226,7 +233,7 @@ export default function UserDashboardPage() {
               meters[id] ? (
                 <MeterCard key={id} meterId={id} meter={meters[id]} />
               ) : (
-                <div key={id} className="rounded-xl border border-white/10 bg-solar-accent p-5 h-36 animate-pulse" />
+                <SkeletonCard key={id} height={160} />
               )
             )}
           </div>
